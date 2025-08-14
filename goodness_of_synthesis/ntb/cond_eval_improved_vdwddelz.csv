@@ -1,0 +1,3 @@
+target_col,condition_cols,category_combo,test,stat_old,p_value_old,p_value_lsm,stat_lsm
+vdwddelz,vdlfl3 & hisp & vdcount & vdlfl1z & vdexf7z,"(1.0, 2.0]|(-0.001, 1.0]|(-0.001, 1.0]|nan|nan",KS,0.8333333333333334,0.04761904761904761,1.0,0.0
+vdwddelz,vdsevens & vdexf7z & vdwdimmz & vdlfl1z & vdori,"(-0.001, 3.0]|nan|(0.4, 0.6]|(0.125, 0.193]|(-0.001, 4.0]",KS,0.2473271560940841,0.030340058776487346,1.0,0.0

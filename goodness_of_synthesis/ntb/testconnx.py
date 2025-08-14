@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Synthetic-vs-GroundTruth conditional difference analysis
+
+Reproduces:
+- Random k-variable (k>=2) conditional KS/Chi2 tests
+- Target-wise comparison table (old vs LSM synthetic)
+- Conditional sets where LSM improves over old synthetic
+
+Usage example:
+python synthetic_eval.py \
+  --orig groundtruth.csv \
+  --old  synthdata.csv \
+  --lsm  LSM_synthetic.csv \
+  --targets vdwddelz vdlfl1z \
+  --k 4 --n_combos 50 --seed 0 \
+  --out_prefix cond_eval
+"""
+
+import argparse
+import warnings
+import numpy as np
+import pandas as pd
+from itertools import combinations
+from scipy.stats import ks_2samp, chi2_contingency
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+def load_and_align(orig_csv, syn_old_csv, syn_lsm_csv, drop_cols=None):
+    """Load CSVs, drop ID/index columns, and align columns by name to the intersection with ground truth."""
+    drop_cols = drop_cols or ["Unnamed: 0", "HHID"]
+    df_orig = pd.read_csv(orig_csv)
+    df_old = pd.read_csv(syn_old_csv) if syn_old_csv else None
+    df_lsm = pd.read_csv(syn_lsm_csv) if syn_lsm_csv else None
+
+    for df in [df_orig, df_old, df_lsm]:
+        if df is not None:
+            for c in drop_cols:
+                if c in df.columns:
+                    df.drop(columns=[c], inplace=True)
+
+    def align(df):
+        if df is None:
+            return None
+        common = df_orig.columns.intersection(df.columns)
+        return df_orig[common].copy(), df[common].copy()
+
+    aligned_old = align(df_old)
+    aligned_lsm = align(df_lsm)
+    return df_orig, aligned_old, aligned_lsm
+
+def conditional_differences_k_vars_random(df1, df2, k=4, n_combos=50, max_categories=3, random_state=0):
+    """
+    Compare distributions of each target column conditioned on k variables.
+    Numeric conditioning variables are binned into quantiles (max_categories bins).
+    Returns long DataFrame: (condition_cols, category_combo, target_col, test, stat, p_value).
+    """
+    rng = np.random.default_rng(random_state)
+    results = []
+    all_cols = list(df1.columns)
+    if len(all_cols) <= k:
+        raise ValueError(f"Need at least k+1 columns; got {len(all_cols)} with k={k}.")
+
+    is_num = {c: np.issubdtype(df1[c].dtype, np.number) for c in all_cols}
+
+    for _ in tqdm(range(n_combos)):
+        cond_cols = list(rng.choice(all_cols, size=k, replace=False))
+
+        bins_df1, bins_df2 = [], []
+        skip = False
+        for col in cond_cols:
+            if is_num[col]:
+                try:
+                    b1 = pd.qcut(df1[col], q=max_categories, duplicates='drop')
+                    b2 = pd.qcut(df2[col], q=max_categories, duplicates='drop')
+                except Exception:
+                    # Fallback if too few unique values
+                    b1 = df1[col].astype("category")
+                    b2 = df2[col].astype("category")
+            else:
+                b1 = df1[col].astype("category")
+                b2 = df2[col].astype("category")
+
+            if b1.dropna().empty or b2.dropna().empty:
+                skip = True
+                break
+
+            bins_df1.append(b1.astype(str))
+            bins_df2.append(b2.astype(str))
+
+        if skip:
+            continue
+
+        combined1 = bins_df1[0]
+        combined2 = bins_df2[0]
+        for i in range(1, k):
+            combined1 = combined1 + "|" + bins_df1[i]
+            combined2 = combined2 + "|" + bins_df2[i]
+
+        for cat in pd.unique(combined1):
+            idx1 = combined1 == cat
+            idx2 = combined2 == cat
+            if idx1.sum() < 2 or idx2.sum() < 2:
+                continue
+
+            for target_col in all_cols:
+                if target_col in cond_cols:
+                    continue
+
+                if is_num[target_col]:
+                    vals1 = df1.loc[idx1, target_col].dropna().to_numpy()
+                    vals2 = df2.loc[idx2, target_col].dropna().to_numpy()
+                    if len(vals1) > 1 and len(vals2) > 1:
+                        ks_stat, ks_p = ks_2samp(vals1, vals2, alternative="two-sided", mode="auto")
+                        results.append({
+                            "condition_cols": " & ".join(cond_cols),
+                            "category_combo": cat,
+                            "target_col": target_col,
+                            "test": "KS",
+                            "stat": float(ks_stat),
+                            "p_value": float(ks_p)
+                        })
+                else:
+                    c1 = df1.loc[idx1, target_col].value_counts()
+                    c2 = df2.loc[idx2, target_col].value_counts()
+                    cats = sorted(set(c1.index) | set(c2.index))
+                    if len(cats) > 1:
+                        obs = np.array([[c1.get(c, 0), c2.get(c, 0)] for c in cats])
+                        chi2_stat, chi2_p, _, _ = chi2_contingency(obs)
+                        results.append({
+                            "condition_cols": " & ".join(cond_cols),
+                            "category_combo": cat,
+                            "target_col": target_col,
+                            "test": "Chi2",
+                            "stat": float(chi2_stat),
+                            "p_value": float(chi2_p)
+                        })
+
+    return pd.DataFrame(results)
+
+def compare_targets(df_orig, df_old, df_lsm, targets, k=4, n_combos=50, seed=0):
+    """
+    Build the comparison table for selected targets:
+    - sig_diffs_old: count of significant conditional differences vs orig (old synthetic)
+    - sig_diffs_new: same for LSM synthetic
+    - better: which synthetic is closer to orig (fewer sig diffs)
+    """
+    cond_old = conditional_differences_k_vars_random(df_orig, df_old, k=k, n_combos=n_combos, random_state=seed)
+    cond_lsm = conditional_differences_k_vars_random(df_orig, df_lsm, k=k, n_combos=n_combos, random_state=seed)
+
+    rows = []
+    for t in targets:
+        old_t = cond_old.loc[cond_old["target_col"] == t]
+        lsm_t = cond_lsm.loc[cond_lsm["target_col"] == t]
+        sig_old = int((old_t["p_value"] < 0.05).sum())
+        sig_lsm = int((lsm_t["p_value"] < 0.05).sum())
+        rows.append({
+            "target": t,
+            "sig_diffs_old": sig_old,
+            "sig_diffs_new": sig_lsm,
+            "better": "LSM" if sig_lsm < sig_old else "Old synthetic"
+        })
+    return pd.DataFrame(rows)
+
+
+def improved_sets(df_orig, df_old, df_lsm, target, k=4, n_combos=50, seed=0):
+    """
+    Return conditional sets where OLD synthetic is significant (p<0.05)
+    but LSM is NOT (p>=0.05) for a given target.
+    """
+    cond_old = conditional_differences_k_vars_random(
+        df_orig, df_old, k=k, n_combos=n_combos, random_state=seed
+    )
+    cond_lsm = conditional_differences_k_vars_random(
+        df_orig, df_lsm, k=k, n_combos=n_combos, random_state=seed
+    )
+
+    # Filter to the target
+    old_t = cond_old[cond_old["target_col"] == target].copy()
+    lsm_t = cond_lsm[cond_lsm["target_col"] == target].copy()
+
+    # Keep only what we need and rename to avoid suffix ambiguity
+    old_t = old_t.loc[:, ["target_col", "condition_cols", "category_combo", "test", "stat", "p_value"]]
+    lsm_t = lsm_t.loc[:, ["target_col", "condition_cols", "category_combo", "test", "stat", "p_value"]]
+
+    old_t.rename(columns={"stat": "stat_old", "p_value": "p_value_old"}, inplace=True)
+    lsm_t.rename(columns={"stat": "stat_lsm", "p_value": "p_value_lsm"}, inplace=True)
+
+    # Candidate improvements: old significant, LSM not
+    old_sig = old_t[old_t["p_value_old"] < 0.05]
+
+    # Merge on the exact same conditional keys
+    join_cols = ["target_col", "condition_cols", "category_combo", "test"]
+    merged = pd.merge(
+        old_sig, lsm_t[join_cols + ["p_value_lsm", "stat_lsm"]],
+        how="left", on=join_cols
+    )
+
+    # Keep rows where LSM exists and is not significant
+    improved = merged[merged["p_value_lsm"].notna() & (merged["p_value_lsm"] >= 0.05)].copy()
+
+    # Sort by the OLD effect size (bigger = worse in old, so bigger improvement if LSM fixes it)
+    improved.sort_values(by="stat_old", ascending=False, inplace=True)
+    return improved.reset_index(drop=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Conditional difference analysis for synthetic datasets.")
+    parser.add_argument("--orig", required=True, help="Path to groundtruth CSV")
+    parser.add_argument("--old", required=True, help="Path to original synthetic CSV")
+    parser.add_argument("--lsm", required=True, help="Path to LSM synthetic CSV to evaluate")
+    parser.add_argument("--targets", nargs="+", default=["vdwddelz", "vdlfl1z"], help="Target columns to compare")
+    parser.add_argument("--k", type=int, default=4, help="Number of conditioning variables")
+    parser.add_argument("--n_combos", type=int, default=50, help="Number of random conditioning combinations")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
+    parser.add_argument("--out_prefix", default="cond_eval", help="Prefix for output CSVs")
+    args = parser.parse_args()
+
+    df_orig, aligned_old, aligned_lsm = load_and_align(args.orig, args.old, args.lsm)
+    if aligned_old is None or aligned_lsm is None:
+        raise ValueError("Could not align columns. Check that the CSVs share common column names.")
+
+    df_orig_aligned_old, df_old_aligned = aligned_old
+    df_orig_aligned_lsm, df_lsm_aligned = aligned_lsm
+
+    common = df_orig_aligned_old.columns.intersection(df_orig_aligned_lsm.columns)
+    df_orig_use = df_orig_aligned_old[common]
+    df_old_use  = df_old_aligned[common]
+    df_lsm_use  = df_lsm_aligned[common]
+
+    comp = compare_targets(df_orig_use, df_old_use, df_lsm_use,
+                           targets=args.targets, k=args.k, n_combos=args.n_combos, seed=args.seed)
+    comp_path = f"{args.out_prefix}_comparison.csv"
+    comp.to_csv(comp_path, index=False)
+
+    for t in args.targets:
+        imp = improved_sets(df_orig_use, df_old_use, df_lsm_use,
+                            target=t, k=args.k, n_combos=args.n_combos, seed=args.seed)
+        imp_path = f"{args.out_prefix}_improved_{t}.csv"
+        imp.to_csv(imp_path, index=False)
+
+    print("Saved:")
+    print(" -", comp_path)
+    for t in args.targets:
+        print(f" - {args.out_prefix}_improved_{t}.csv")
+
+if __name__ == "__main__":
+    main()
